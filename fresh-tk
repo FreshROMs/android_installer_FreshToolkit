@@ -1,0 +1,217 @@
+#!/sbin/sh
+# =========================================
+#         _____              _
+#        |  ___| __ ___  ___| |__
+#        | |_ | '__/ _ \/ __| '_ \
+#        |  _|| | |  __/\__ \ | | |
+#        |_|  |_|  \___||___/_| |_|
+#
+# =========================================
+#
+#  Fresh install toolkit
+#  The Fresh Project
+#  Copyright (C) 2019-2022 John Vincent - TenSeventy7@XDA
+#            (C) 2024-2025 Louis Poier - PeterKnecht93@XDA
+#
+#  This program is free software: you can redistribute it and/or modify
+#  it under the terms of the GNU General Public License as published by
+#  the Free Software Foundation, either version 3 of the License, or
+#  (at your option) any later version.
+#
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU General Public License for more details.
+#
+#  You should have received a copy of the GNU General Public License
+#  along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+#  =========================
+#
+# shellcheck disable=SC2207,SC3010,SC3012,SC3014,SC3030,SC3043,SC3054
+#
+
+# [
+EXEC="$*" #-- Function to execute for the installer. DO NOT EDIT.
+BUSYBOX="/tmp/fresh/tools/busybox" #-- Location of the busybox binary
+
+TOOLKIT_PROP="/tmp/fresh/toolkit.prop" #-- Location of the generated prop file used by the installer
+PACKAGE_PROP="/tmp/fresh/package.prop" #-- Location of the prop file from the installation package
+FRESH_PROP="/system_root/system/system_ext/etc/fresh.prop" #-- Location of the prop file from the currently installed ROM
+# ]
+
+##
+## file_getprop()
+##
+## Description:
+## - Retrieve a property value from the specified file.
+##
+## Usage:
+## - file_getprop <file> <prop>
+##
+file_getprop() {
+	local file prop
+	file="${1}"; prop="${2}"
+	[ $# -lt 2 ] && return 1
+
+	grep "^$prop=" "$file" | cut -d= -f2-
+}
+
+##
+## file_setprop()
+##
+## Description:
+## - Set or remove a property in the specified file.
+##
+## Usage:
+## - file_setprop <file> <prop> <value>
+## - file_setprop <file> <prop> --delete
+##
+file_setprop() {
+	local file prop value
+	file="${1}"; prop="${2}"; value="${3}"
+	[ $# -lt 3 ] && return 1
+
+	if [[ $value == --delete ]]; then
+		#-- Delete property
+		sed -i "/$prop=/d" "$file"
+	elif [ -f "$file" ] && grep -q "$prop" "$file"; then
+		#-- Change property value
+		sed -i "/$prop/c\\$prop=$value" "$file"
+	else
+		#-- Add property
+		! grep -q '# end of file' "$file" && echo "# end of file" >> "$file"
+		sed -i "/# end of file/i $prop=$value" "$file"
+	fi
+
+	return 0
+}
+
+##
+## device_check()
+##
+## Description:
+## - Check if the bootloader version contains any
+##   of the supported model numbers.
+##
+## Usage:
+## - device_check
+##
+device_check() {
+    local supported model
+    supported=($(file_getprop "$PACKAGE_PROP" 'pkg.models'))
+
+    for model in "${supported[@]}"; do
+		if [[ SM-$(getprop 'ro.boot.bootloader') == "$model"* ]]; then
+			#-- Model matched bootloader version, break the loop and return
+            file_setprop "$TOOLKIT_PROP" 'device.model' "$model"
+            break
+        else
+			#-- Model did not match bootloader version, continue with next model
+            file_setprop "$TOOLKIT_PROP" 'device.model' 'fail'
+        fi
+    done
+
+	return 0
+}
+
+##
+## part_check()
+##
+## Description:
+## - Scan for the required partitions and 
+##   add them to the toolkit prop.
+##
+## Usage:
+## - part_check
+##
+part_check() {
+	local partitions partition blockpath
+	partitions="system vendor product odm prism optics omr boot recovery up_param dtb dtbo init_boot vendor_boot system_dlkm vendor_dlkm"
+
+	for partition in $partitions; do
+		if [[ $(file_getprop "$PACKAGE_PROP" "pkg.has_$partition") == true ]]; then
+			blockpath=$($BUSYBOX find '/dev/block' -iname "$partition" -print -quit 2>/dev/null)
+
+			if [ -e "$blockpath" ]; then
+				#-- Partition was found, continue with next partition
+				file_setprop "$TOOLKIT_PROP" "part.block.$partition" "$blockpath"
+			else
+				#-- Partition was not found, break the loop and return
+				file_setprop "$TOOLKIT_PROP" 'part.check' 'fail'
+				break
+			fi
+		fi
+	done
+
+	return 0
+}
+
+##
+## version_check()
+##
+## Description:
+## - Check for an existing ROM installation.
+## - Downgrades are considered a new installation.
+##
+## Usage:
+## - version_check
+##
+version_check() {
+	local pkg_version fresh_version
+	pkg_version=$(file_getprop "$PACKAGE_PROP" 'fresh.build.version')
+	fresh_version=$(file_getprop "$FRESH_PROP" 'ro.fresh.build.version')
+
+	#-- Default to new install
+	file_setprop "$TOOLKIT_PROP" 'install.type' 'new'
+
+	if [[ $pkg_version == "$fresh_version" ]]; then
+		#-- Package version and installed version match, user is re-installing
+		file_setprop "$TOOLKIT_PROP" 'install.type' 'reinstall'
+	elif [[ $pkg_version > $fresh_version ]]; then
+		#-- Package version is newer than installed version, user is upgrading
+		file_setprop "$TOOLKIT_PROP" 'install.type' 'upgrade'
+	fi
+
+	return 0
+}
+
+##
+## calc_install_progress()
+##
+## Description:
+## - Calculate the system install progress value
+##   based on the partitions shipped with the package.
+##
+## Usage:
+## - calc_install_progress
+##
+calc_install_progress() {
+	local partitions progress partition
+	partitions="super_empty system vendor product odm prism optics boot recovery up_param dtb dtbo init_boot vendor_boot system_dlkm vendor_dlkm"
+	progress=0.95
+
+	for partition in $partitions; do
+		if [[ $(file_getprop "$PACKAGE_PROP" "pkg.has_$partition") == true ]]; then
+			case "$partition" in
+			super_empty|vendor|product) progress=$(echo "$progress 0.1 -p" | $BUSYBOX dc) ;;
+			odm|prism)                  progress=$(echo "$progress 0.025 -p" | $BUSYBOX dc) ;;
+			*)                          progress=$(echo "$progress 0.01 -p" | $BUSYBOX dc) ;;
+			esac
+		fi
+	done
+
+	file_setprop "$TOOLKIT_PROP" 'part.progress.system' "$progress"
+
+	return 0
+}
+
+##
+## Execute the function given by updater-script
+##
+if [ -n "$EXEC" ]; then
+	$EXEC
+else
+	sleep 1
+	exit 1
+fi
