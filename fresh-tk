@@ -28,12 +28,16 @@
 #
 #  =========================
 #
-# shellcheck disable=SC2207,SC3010,SC3012,SC3014,SC3030,SC3043,SC3054
+# shellcheck disable=SC2174,SC2207,SC3010,SC3012,SC3014,SC3024,SC3030,SC3043,SC3054
 #
 
 # [
 EXEC="$*" #-- Function to execute for the installer. DO NOT EDIT.
 BUSYBOX="/tmp/fresh/tools/busybox" #-- Location of the busybox binary
+
+FRESH_PATH="/system_root/system/system_ext/etc/fresh" #-- Path of the Fresh directory
+INSTALL_WIZARD_PATH="/tmp/install-wizard" #-- Path of the install wizard
+OVERLAY_PATH="/omr/my_bigball" #-- Path of the overlay directory
 
 TOOLKIT_PROP="/tmp/fresh/toolkit.prop" #-- Location of the generated prop file used by the installer
 PACKAGE_PROP="/tmp/fresh/package.prop" #-- Location of the prop file from the installation package
@@ -126,11 +130,15 @@ device_check() {
 ## - part_check
 ##
 part_check() {
-	local partitions partition blockpath
-	partitions="system vendor product odm prism optics omr boot recovery up_param dtb dtbo init_boot vendor_boot system_dlkm vendor_dlkm"
+	local IS_WIZARD_INSTALL partitions partition blockpath
+	IS_WIZARD_INSTALL=$(file_getprop "$PACKAGE_PROP" 'install.use_wizard')
+	partitions="system vendor product odm prism optics boot recovery up_param dtb dtbo init_boot vendor_boot system_dlkm vendor_dlkm"
+
+	#-- Require OMR partition on wizard installs
+	$IS_WIZARD_INSTALL && partitions+=" omr"
 
 	for partition in $partitions; do
-		if [[ $(file_getprop "$PACKAGE_PROP" "pkg.has_$partition") == true ]]; then
+		if [[ $(file_getprop "$PACKAGE_PROP" "pkg.has_$partition") == true ]] || [[ $partition == omr ]]; then
 			blockpath=$($BUSYBOX find '/dev/block' -iname "$partition" -print -quit 2>/dev/null)
 
 			if [ -e "$blockpath" ]; then
@@ -160,7 +168,8 @@ part_check() {
 ## - version_check [expected version]
 ##
 version_check() {
-	local pkg_version fresh_version expected_version
+	local IS_WIZARD_INSTALL pkg_version fresh_version expected_version install_type
+	IS_WIZARD_INSTALL=$(file_getprop "$PACKAGE_PROP" 'install.use_wizard')
 	pkg_version=$(file_getprop "$PACKAGE_PROP" 'fresh.build.version')
 	fresh_version=$(file_getprop "$FRESH_PROP" 'ro.fresh.build.version')
 	expected_version=${1}
@@ -176,17 +185,22 @@ version_check() {
 		fi
 	fi
 
-	#-- Default to new install
-	file_setprop "$TOOLKIT_PROP" 'install.type' 'new'
-
-	if [[ $pkg_version == "$fresh_version" ]]; then
+	#-- Check installation type
+	if $IS_WIZARD_INSTALL && ! [[ -d "$OVERLAY_PATH" || -d "$FRESH_PATH/overrides" ]]; then
+		#-- Installing a wizard package but no addons were found, consider this a new install
+		install_type="new"
+	elif [[ $pkg_version == "$fresh_version" ]]; then
 		#-- Package version and installed version match, user is re-installing
-		file_setprop "$TOOLKIT_PROP" 'install.type' 'reinstall'
+		install_type="reinstall"
 	elif [[ $pkg_version > $fresh_version ]]; then
 		#-- Package version is newer than installed version, user is upgrading
-		file_setprop "$TOOLKIT_PROP" 'install.type' 'upgrade'
+		install_type="upgrade"
+	else
+		#-- Package version neither matches nor is newer than installed version, user is new or downgrading
+		install_type="new"
 	fi
 
+	file_setprop "$TOOLKIT_PROP" 'install.type' "$install_type"
 	return 0
 }
 
@@ -216,6 +230,145 @@ calc_install_progress() {
 	done
 
 	file_setprop "$TOOLKIT_PROP" 'part.progress.system' "$progress"
+
+	return 0
+}
+
+##
+## migrate_addon_list()
+##
+## Description:
+## - Migrates addon selections from a previous Fresh installation.
+##
+## Usage:
+## - migrate_addon_list
+##
+migrate_addon_list() {
+	#-- Google
+	if [ -f  "$OVERLAY_PATH/fresh/install-wizard/google.prop" ]; then
+		cp -a -f "$OVERLAY_PATH/fresh/install-wizard/google.prop" "$INSTALL_WIZARD_PATH/google.prop"
+	else
+		cp -a -f "$FRESH_PATH/overrides/install-wizard/google.prop" "$INSTALL_WIZARD_PATH/google.prop"
+	fi
+
+	#-- Bixby
+	if [ -f  "$OVERLAY_PATH/fresh/install-wizard/bixby.prop" ]; then
+		cp -a -f "$OVERLAY_PATH/fresh/install-wizard/bixby.prop" "$INSTALL_WIZARD_PATH/bixby.prop"
+	else
+		file_setprop "$INSTALL_WIZARD_PATH/bixby.prop" 'item.0.1' "$(file_getprop "$FRESH_PATH/overrides/install-wizard/bixby.prop" 'item.0.1')" #-- Bixby Voice
+		file_setprop "$INSTALL_WIZARD_PATH/bixby.prop" 'item.0.2' "$(file_getprop "$FRESH_PATH/overrides/install-wizard/bixby.prop" 'item.0.2')" #-- Bixby Vision
+	fi
+
+	#-- Seamless
+	if [ -f  "$OVERLAY_PATH/fresh/install-wizard/seamless.prop" ]; then
+		cp -a -f "$OVERLAY_PATH/fresh/install-wizard/seamless.prop" "$INSTALL_WIZARD_PATH/seamless.prop"
+	else
+		file_setprop "$INSTALL_WIZARD_PATH/seamless.prop" 'item.0.1' "$(file_getprop "$FRESH_PATH/overrides/install-wizard/seamless.prop" 'item.0.2')" #-- Link To Windows
+		file_setprop "$INSTALL_WIZARD_PATH/seamless.prop" 'item.0.2' '0'                                                                               #-- Camera Sharing
+		file_setprop "$INSTALL_WIZARD_PATH/seamless.prop" 'item.0.3' "$(file_getprop "$FRESH_PATH/overrides/install-wizard/seamless.prop" 'item.0.3')" #-- Call & Text on other devices
+	fi
+
+	#-- Security
+	if [ -f  "$OVERLAY_PATH/fresh/install-wizard/security.prop" ]; then
+		cp -a -f "$OVERLAY_PATH/fresh/install-wizard/security.prop" "$INSTALL_WIZARD_PATH/security.prop"
+	else
+		file_setprop "$INSTALL_WIZARD_PATH/security.prop" 'item.0.1' "$(file_getprop "$FRESH_PATH/overrides/install-wizard/security.prop" 'item.0.4')" #-- Checkout
+		file_setprop "$INSTALL_WIZARD_PATH/security.prop" 'item.0.2' "$(file_getprop "$FRESH_PATH/overrides/install-wizard/security.prop" 'item.0.2')" #-- Secure Folder
+		file_setprop "$INSTALL_WIZARD_PATH/security.prop" 'item.0.3' '0'                                                                               #-- Secure Wi-Fi
+		file_setprop "$INSTALL_WIZARD_PATH/security.prop" 'item.0.4' '0'                                                                               #-- Auto Blocker
+	fi
+
+	#-- AR Zone
+	if [ -f  "$OVERLAY_PATH/fresh/install-wizard/ar_zone.prop" ]; then
+		cp -a -f "$OVERLAY_PATH/fresh/install-wizard/ar_zone.prop" "$INSTALL_WIZARD_PATH/ar_zone.prop"
+	else
+		file_setprop "$INSTALL_WIZARD_PATH/ar_zone.prop" 'item.0.1' "$(file_getprop "$FRESH_PATH/overrides/install-wizard/ar-zone.prop" 'item.0.2')" #-- AR Emoji
+		file_setprop "$INSTALL_WIZARD_PATH/ar_zone.prop" 'item.0.2' "$(file_getprop "$FRESH_PATH/overrides/install-wizard/ar-zone.prop" 'item.0.3')" #-- AR Doodle
+		file_setprop "$INSTALL_WIZARD_PATH/ar_zone.prop" 'item.0.3' "$(file_getprop "$FRESH_PATH/overrides/install-wizard/ar-zone.prop" 'item.0.4')" #-- DecoPic
+	fi
+
+	#-- Galaxy AI
+	if [ -f  "$OVERLAY_PATH/fresh/install-wizard/gai.prop" ]; then
+		cp -a -f "$OVERLAY_PATH/fresh/install-wizard/gai.prop" "$INSTALL_WIZARD_PATH/gai.prop"
+	else
+		file_setprop "$INSTALL_WIZARD_PATH/gai.prop" 'item.0.1' '1' #-- AI Wallpaper
+		file_setprop "$INSTALL_WIZARD_PATH/gai.prop" 'item.0.2' '1' #-- Call Assistant
+		file_setprop "$INSTALL_WIZARD_PATH/gai.prop" 'item.0.3' '1' #-- Interpreter
+	fi
+
+	#-- Misc
+	if [ -f  "$OVERLAY_PATH/fresh/install-wizard/misc.prop" ]; then
+		cp -a -f "$OVERLAY_PATH/fresh/install-wizard/misc.prop" "$INSTALL_WIZARD_PATH/misc.prop"
+	else
+		file_setprop "$INSTALL_WIZARD_PATH/misc.prop" 'item.0.1' '1'                                                                                #-- Samsung DeX
+		file_setprop "$INSTALL_WIZARD_PATH/misc.prop" 'item.0.2' '1'                                                                                #-- Samsung Find
+		file_setprop "$INSTALL_WIZARD_PATH/misc.prop" 'item.0.3' '1'                                                                                #-- Smart Suggestions
+		file_setprop "$INSTALL_WIZARD_PATH/misc.prop" 'item.0.4' "$(file_getprop "$FRESH_PATH/overrides/install-wizard/game-home.prop" 'item.0.1')" #-- Game Tools
+	fi
+
+	return 0
+}
+
+##
+## export_addon_list()
+##
+## Description:
+## - Export addon selections for future installations.
+##
+## Usage:
+## - export_addon_list
+##
+export_addon_list() {
+	local PROPS
+	PROPS="google.prop bixby.prop seamless.prop security.prop ar_zone.prop gai.prop misc.prop"
+
+	mkdir -p "$OVERLAY_PATH/fresh/install-wizard"
+	for prop in $PROPS; do
+		cp -a -f "$INSTALL_WIZARD_PATH/$prop" "$OVERLAY_PATH/fresh/install-wizard/$prop"
+	done
+}
+
+##
+## init_overlay()
+##
+## Description:
+## - Clear any existing addon whiteouts and setup common directories.
+##
+## Usage:
+## - init_overlay
+##
+init_overlay() {
+	rm -rf "$OVERLAY_PATH"
+
+	mkdir -p -m 755 -Z u:object_r:system_file:s0 "$OVERLAY_PATH/system/app"
+	mkdir -p -m 755 -Z u:object_r:system_file:s0 "$OVERLAY_PATH/system/etc"
+	mkdir -p -m 755 -Z u:object_r:system_file:s0 "$OVERLAY_PATH/system/priv-app"
+
+	mkdir -p -m 755 -Z u:object_r:system_file:s0 "$OVERLAY_PATH/product/app"
+	mkdir -p -m 755 -Z u:object_r:system_file:s0 "$OVERLAY_PATH/product/etc"
+	mkdir -p -m 755 -Z u:object_r:system_file:s0 "$OVERLAY_PATH/product/priv-app"
+
+	return 0
+}
+
+##
+## addon_remove()
+##
+## Description:
+## - Generate whiteout files for the given addon.
+##
+## Usage:
+## - addon_remove <repo> <addon>
+##
+addon_remove() {
+	local REPO ADDON REPO_FILES
+	REPO="${1}"; ADDON="${2}"
+	REPO_FILES=($(awk '!/^#/ {  print $0 }' "/tmp/fresh/repository/$REPO/$ADDON.repo"))
+
+	for file in "${REPO_FILES[@]}"; do
+		mkdir -p -m 755 -Z u:object_r:system_file:s0 "$OVERLAY_PATH/$(dirname "$file")"
+		mknod "$OVERLAY_PATH/$file" c 0 0
+	done
 
 	return 0
 }
