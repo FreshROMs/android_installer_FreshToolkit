@@ -153,14 +153,28 @@ part_check() {
 ## Description:
 ## - Check for an existing ROM installation.
 ## - Downgrades are considered a new installation.
+## - Optionally specify a build version that the device
+##   is expected to run.
 ##
 ## Usage:
-## - version_check
+## - version_check [expected version]
 ##
 version_check() {
-	local pkg_version fresh_version
+	local pkg_version fresh_version expected_version
 	pkg_version=$(file_getprop "$PACKAGE_PROP" 'fresh.build.version')
 	fresh_version=$(file_getprop "$FRESH_PROP" 'ro.fresh.build.version')
+	expected_version=${1}
+
+	#-- Probe for expected version if specified
+	if [ -n "$expected_version" ]; then
+		if [[ $expected_version == "$fresh_version" ]]; then
+			#-- Version requirement met
+			file_setprop "$TOOLKIT_PROP" 'install.eligible' 'true'
+		else
+			#-- Version requirement not met
+			file_setprop "$TOOLKIT_PROP" 'install.eligible' 'false'
+		fi
+	fi
 
 	#-- Default to new install
 	file_setprop "$TOOLKIT_PROP" 'install.type' 'new'
